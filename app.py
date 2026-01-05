@@ -4,14 +4,27 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 from dataclasses import dataclass
+from typing import Optional
 
-# --- CONFIG & STYLE ---
-st.set_page_config(page_title="Credit Simulator - Inflation Comparison", layout="wide")
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+st.set_page_config(
+    page_title="Leverage vs Inflation Erosion",
+    page_icon="🏦",
+    layout="wide"
+)
 
+# =============================================================================
+# STYLES
+# =============================================================================
 st.markdown("""
-    <style>
+<style>
+    /* Main background */
     .main { background-color: #f8f9fa; }
-    [data-testid="stMetricValue"] { color: #1f1f1f !important; }
+    
+    /* Metrics */
+    [data-testid="stMetricValue"] { color: #1f1f1f !important; font-weight: 600; }
     [data-testid="stMetricLabel"] { color: #4b4b4b !important; }
     .stMetric {
         background-color: #ffffff;
@@ -20,946 +33,1347 @@ st.markdown("""
         box-shadow: 0 2px 4px rgba(0,0,0,0.05);
         border: 1px solid #e0e0e0;
     }
+    
+    /* Custom boxes */
     .highlight-box {
         padding: 20px;
         border-radius: 15px;
         margin-bottom: 25px;
         text-align: center;
     }
-    .box-positive { background-color: #e8f8f0; border-left: 5px solid #00CC96; }
-    .box-neutral { background-color: #fef9e7; border-left: 5px solid #f1c40f; }
-    .box-negative { background-color: #fdedec; border-left: 5px solid #e74c3c; }
-    .insight-box {
-        background-color: #e8f4fd;
-        border-left: 5px solid #3498db;
-        padding: 15px;
-        border-radius: 8px;
-        margin: 10px 0;
+    .box-positive { background-color: #d4edda; border-left: 5px solid #28a745; }
+    .box-negative { background-color: #f8d7da; border-left: 5px solid #dc3545; }
+    .box-warning { background-color: #fff3cd; border-left: 5px solid #ffc107; }
+    .box-info { background-color: #d1ecf1; border-left: 5px solid #17a2b8; }
+    
+    /* Key insight boxes */
+    .key-insight {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 25px;
+        border-radius: 15px;
+        margin: 20px 0;
+        text-align: center;
     }
-    </style>
+    .key-insight h2 { color: white; margin: 0; font-size: 2em; }
+    .key-insight p { color: rgba(255,255,255,0.9); margin-top: 10px; }
+    
+    /* Bank loss box */
+    .bank-loss-box {
+        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        color: white;
+        padding: 25px;
+        border-radius: 15px;
+        margin: 20px 0;
+        text-align: center;
+    }
+    .bank-loss-box h2 { color: white; margin: 0; }
+    
+    /* Erosion warning box */
+    .erosion-warning {
+        background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);
+        color: white;
+        padding: 25px;
+        border-radius: 15px;
+        margin: 20px 0;
+        text-align: center;
+    }
+    .erosion-warning h2 { color: white; margin: 0; }
+    
+    /* Section headers */
+    .section-header {
+        background-color: #2c3e50;
+        color: white;
+        padding: 10px 20px;
+        border-radius: 8px;
+        margin: 20px 0 15px 0;
+    }
+</style>
 """, unsafe_allow_html=True)
 
 
-# --- HELPERS ---
-def fmt(value: float) -> str:
-    """Format number with space as thousands separator."""
-    return f"{round(value, 2):,}".replace(",", " ")
+# =============================================================================
+# DATA STRUCTURES
+# =============================================================================
+@dataclass
+class LoanMetrics:
+    """Core loan calculation results."""
+    df: pd.DataFrame
+    monthly_payment: float
+    # Nominal values (what you see on paper)
+    total_interest_nominal: float
+    total_cost_nominal: float  # principal + interest
+    # Actualized values (real purchasing power)
+    total_interest_actualized: float
+    total_principal_actualized: float
+    total_cost_actualized: float  # principal + interest actualized
+    # Cash flows
+    total_rent_nominal: float
+    total_rent_actualized: float
+    total_charges_nominal: float
+    total_charges_actualized: float
 
 
 @dataclass
-class AmortResult:
-    df: pd.DataFrame
-    monthly_payment: float
-    total_int_nom: float
-    total_int_act: float
-    total_cap_act: float
-    total_rent_nom: float
-    total_rent_act: float
-    total_charges_nom: float
-    total_charges_act: float
+class ExitAnalysis:
+    """Optimal exit point analysis."""
+    peak_value_year: int
+    peak_value_amount: float
+    peak_net_net_year: int
+    peak_net_net_amount: float
+    first_decline_year: Optional[int]
+    annual_erosion_rate: float  # % lost per year after loan
 
 
-# --- CALCULATION FUNCTIONS ---
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+def format_currency(value: float) -> str:
+    """Format number as currency with space separator."""
+    return f"{round(value, 0):,.0f}".replace(",", " ")
+
+
+def format_percentage(value: float, decimals: int = 1) -> str:
+    """Format number as percentage."""
+    return f"{round(value, decimals):+.{decimals}f}%"
+
+
+def get_color_for_value(value: float, threshold: float = 0) -> str:
+    """Return green for positive, red for negative values."""
+    return "#28a745" if value >= threshold else "#dc3545"
+
+
+# =============================================================================
+# CORE CALCULATIONS
+# =============================================================================
 @st.cache_data
-def calculate_amortization(
-    initial_property_value: float,
+def calculate_loan_amortization(
+    property_value: float,
     loan_amount: float,
     annual_rate: float,
     loan_years: int,
     projection_years: int,
     inflation_rate: float,
-    real_estate_inflation: float,
-    initial_monthly_rent: float,
-    initial_property_tax: float,
+    real_estate_growth: float,
+    monthly_rent: float,
+    annual_property_tax: float,
     occupancy_rate: float,
     stock_return: float,
     down_payment: float,
-) -> AmortResult:
-    """Calculate amortization table with projection beyond loan term."""
+) -> LoanMetrics:
+    """
+    Calculate complete loan amortization with inflation-adjusted values.
+    
+    Key insight: We track both nominal (paper) values and actualized (real purchasing power) values.
+    The difference reveals how inflation erodes debt and benefits borrowers.
+    """
+    # Monthly rate and payment calculation
     monthly_rate = (annual_rate / 100) / 12
-    nb_months = loan_years * 12
-
+    total_months = loan_years * 12
+    
     if annual_rate > 0:
-        monthly_payment = loan_amount * (monthly_rate * (1 + monthly_rate) ** nb_months) / ((1 + monthly_rate) ** nb_months - 1)
+        monthly_payment = loan_amount * (
+            monthly_rate * (1 + monthly_rate) ** total_months
+        ) / ((1 + monthly_rate) ** total_months - 1)
     else:
-        monthly_payment = loan_amount / nb_months
-
-    # Pre-compute factors
-    inf_factor = 1 + inflation_rate / 100
-    immo_factor = 1 + real_estate_inflation / 100
-    stock_monthly = 1 + (stock_return / 100) / 12
-    occ_factor = occupancy_rate / 100
-
+        monthly_payment = loan_amount / total_months
+    
+    # Growth factors (pre-computed for efficiency)
+    inflation_factor = 1 + inflation_rate / 100
+    real_estate_factor = 1 + real_estate_growth / 100
+    stock_monthly_factor = 1 + (stock_return / 100) / 12
+    occupancy_factor = occupancy_rate / 100
+    
+    # Running totals
     remaining_principal = loan_amount
-    cumul_interest = cumul_principal = 0.0
-    cumul_interest_act = cumul_principal_act = 0.0
-    cumul_rent_nom = cumul_rent_act = 0.0
-    cumul_charges_nom = cumul_charges_act = 0.0
-
-    stock_value_nom = down_payment
-    total_invested_stock = down_payment
-
-    data = []
-
+    
+    # Nominal cumulative values
+    cumul_interest_nom = 0.0
+    cumul_principal_nom = 0.0
+    cumul_rent_nom = 0.0
+    cumul_charges_nom = 0.0
+    
+    # Actualized cumulative values
+    cumul_interest_act = 0.0
+    cumul_principal_act = 0.0
+    cumul_rent_act = 0.0
+    cumul_charges_act = 0.0
+    
+    # Stock portfolio simulation
+    stock_value = down_payment
+    total_stock_invested = down_payment
+    
+    yearly_data = []
+    
     for year in range(1, projection_years + 1):
-        interest_year = principal_year = 0.0
         is_loan_active = year <= loan_years
-
-        for _ in range(12):
+        year_interest = 0.0
+        year_principal = 0.0
+        
+        # Monthly calculations within year
+        for month in range(12):
             if is_loan_active and remaining_principal > 0:
-                i = remaining_principal * monthly_rate
-                p = min(monthly_payment - i, remaining_principal)
-                interest_year += i
-                principal_year += p
-                remaining_principal -= p
-
-                stock_value_nom = stock_value_nom * stock_monthly + monthly_payment
-                total_invested_stock += monthly_payment
+                interest_payment = remaining_principal * monthly_rate
+                principal_payment = min(monthly_payment - interest_payment, remaining_principal)
+                
+                year_interest += interest_payment
+                year_principal += principal_payment
+                remaining_principal -= principal_payment
+                
+                # Stock alternative: invest monthly payment
+                stock_value = stock_value * stock_monthly_factor + monthly_payment
+                total_stock_invested += monthly_payment
             else:
-                stock_value_nom = stock_value_nom * stock_monthly
-
-        discount_factor = 1 / (inf_factor ** year)
-
-        nominal_property_value = initial_property_value * (immo_factor ** year)
-        actualized_property_value = nominal_property_value * discount_factor
-
-        annual_rent_nom = (initial_monthly_rent * 12) * (inf_factor ** (year - 1)) * occ_factor
-        annual_charge_nom = initial_property_tax * (inf_factor ** (year - 1))
-
-        cumul_interest += interest_year
-        cumul_principal += principal_year
-        cumul_interest_act += interest_year * discount_factor
-        cumul_principal_act += principal_year * discount_factor
+                # After loan: stock compounds without new investment
+                stock_value *= stock_monthly_factor
+        
+        # Discount factor: converts future money to today's purchasing power
+        discount_factor = 1 / (inflation_factor ** year)
+        
+        # Property values
+        property_nominal = property_value * (real_estate_factor ** year)
+        property_actualized = property_nominal * discount_factor
+        
+        # Rent and charges (grow with inflation, adjusted for occupancy)
+        annual_rent_nom = (monthly_rent * 12) * (inflation_factor ** (year - 1)) * occupancy_factor
+        annual_charges_nom = annual_property_tax * (inflation_factor ** (year - 1))
+        
+        # Update cumulative values
+        cumul_interest_nom += year_interest
+        cumul_principal_nom += year_principal
+        cumul_interest_act += year_interest * discount_factor
+        cumul_principal_act += year_principal * discount_factor
         cumul_rent_nom += annual_rent_nom
         cumul_rent_act += annual_rent_nom * discount_factor
-        cumul_charges_nom += annual_charge_nom
-        cumul_charges_act += annual_charge_nom * discount_factor
-
-        total_cost_act = cumul_interest_act + cumul_principal_act
-        total_cost_nom = loan_amount + cumul_interest
-
-        # Gains calculations
-        net_gain_nom = nominal_property_value - total_cost_nom
-        net_gain_act = actualized_property_value - total_cost_act
-        net_net_immo_act = (actualized_property_value + cumul_rent_act) - (total_cost_act + cumul_charges_act)
-        net_net_immo_nom = (nominal_property_value + cumul_rent_nom) - (total_cost_nom + cumul_charges_nom)
-
-        # Year-over-year changes for inflection analysis
-        yoy_property_change_act = actualized_property_value * (immo_factor / inf_factor - 1) if year > 1 else 0
-        yoy_net_net_change = 0  # Will be calculated after
-
-        stock_value_act = stock_value_nom * discount_factor
-        stock_gain_act = stock_value_act - (total_invested_stock * discount_factor)
-        stock_gain_nom = stock_value_nom - total_invested_stock
-
-        data.append({
+        cumul_charges_nom += annual_charges_nom
+        cumul_charges_act += annual_charges_nom * discount_factor
+        
+        # Total costs
+        total_paid_nom = cumul_interest_nom + cumul_principal_nom
+        total_paid_act = cumul_interest_act + cumul_principal_act
+        
+        # Net calculations
+        # Net = Property Value - Total Loan Cost
+        net_nominal = property_nominal - (loan_amount + cumul_interest_nom)
+        net_actualized = property_actualized - total_paid_act
+        
+        # Net Net = Net + Rent - Charges (full picture)
+        net_net_nominal = net_nominal + cumul_rent_nom - cumul_charges_nom
+        net_net_actualized = net_actualized + cumul_rent_act - cumul_charges_act
+        
+        # Stock comparison
+        stock_actualized = stock_value * discount_factor
+        stock_gain_nom = stock_value - total_stock_invested
+        stock_gain_act = stock_actualized - (total_stock_invested * discount_factor)
+        
+        yearly_data.append({
             "Year": year,
-            "Loan Active": "Yes" if is_loan_active else "No",
-            "Remaining Principal": round(max(0, remaining_principal), 2),
-            # Property values
-            "Nominal Property Value": round(nominal_property_value, 2),
-            "Actualized Property Value": round(actualized_property_value, 2),
-            # Costs
-            "Cumul. Repayment (Actualized)": round(total_cost_act, 2),
-            "Cumul. Repayment (Nominal)": round(total_cost_nom, 2),
-            "Cumul. Rent (Actualized)": round(cumul_rent_act, 2),
-            "Cumul. Rent (Nominal)": round(cumul_rent_nom, 2),
-            "Cumul. Charges (Actualized)": round(cumul_charges_act, 2),
-            "Cumul. Charges (Nominal)": round(cumul_charges_nom, 2),
-            # Net gains (property - cost)
-            "Net Gain (Nominal)": round(net_gain_nom, 2),
-            "Net Gain (Actualized)": round(net_gain_act, 2),
-            # Net Net gains (property + rent - cost - charges)
-            "Net Net Real Estate (Act.)": round(net_net_immo_act, 2),
-            "Net Net Real Estate (Nom.)": round(net_net_immo_nom, 2),
-            # Stock
-            "Stock Gain (Act.)": round(stock_gain_act, 2),
-            "Stock Gain (Nom.)": round(stock_gain_nom, 2),
-            "Stock Value (Nominal)": round(stock_value_nom, 2),
-            "Stock Value (Actualized)": round(stock_value_act, 2),
-            "Total Invested Stock (Nominal)": round(total_invested_stock, 2),
-            # For inflection analysis
-            "Discount Factor": round(discount_factor, 6),
+            "Loan Active": "✓" if is_loan_active else "✗",
+            "Remaining Principal": round(max(0, remaining_principal), 0),
+            # Property
+            "Property (Nominal)": round(property_nominal, 0),
+            "Property (Actualized)": round(property_actualized, 0),
+            # Loan costs
+            "Cumul. Interest (Nominal)": round(cumul_interest_nom, 0),
+            "Cumul. Interest (Actualized)": round(cumul_interest_act, 0),
+            "Total Paid (Nominal)": round(total_paid_nom, 0),
+            "Total Paid (Actualized)": round(total_paid_act, 0),
+            # Cash flows
+            "Cumul. Rent (Nominal)": round(cumul_rent_nom, 0),
+            "Cumul. Rent (Actualized)": round(cumul_rent_act, 0),
+            "Cumul. Charges (Nominal)": round(cumul_charges_nom, 0),
+            "Cumul. Charges (Actualized)": round(cumul_charges_act, 0),
+            # Net results
+            "Net Gain (Nominal)": round(net_nominal, 0),
+            "Net Gain (Actualized)": round(net_actualized, 0),
+            "Net Net (Nominal)": round(net_net_nominal, 0),
+            "Net Net (Actualized)": round(net_net_actualized, 0),
+            # Stock comparison
+            "Stock Value (Nominal)": round(stock_value, 0),
+            "Stock Value (Actualized)": round(stock_actualized, 0),
+            "Stock Gain (Nominal)": round(stock_gain_nom, 0),
+            "Stock Gain (Actualized)": round(stock_gain_act, 0),
+            "Stock Invested": round(total_stock_invested, 0),
+            # Analysis helpers
+            "Discount Factor": round(discount_factor, 4),
+            "YoY Property Change (Act.)": 0,  # Filled below
         })
-
-    df = pd.DataFrame(data)
-
-    # Calculate YoY changes
-    df["YoY Property Change (Act.)"] = df["Actualized Property Value"].diff().fillna(0).round(2)
-    df["YoY Net Net Change (Act.)"] = df["Net Net Real Estate (Act.)"].diff().fillna(0).round(2)
-    df["YoY Property Change (Nom.)"] = df["Nominal Property Value"].diff().fillna(0).round(2)
-    df["YoY Net Net Change (Nom.)"] = df["Net Net Real Estate (Nom.)"].diff().fillna(0).round(2)
-
-    # Annualized return rates
-    df["Actualized Annual Return (%)"] = (df["YoY Property Change (Act.)"] / df["Actualized Property Value"].shift(1) * 100).fillna(0).round(2)
-    df["Nominal Annual Return (%)"] = (df["YoY Property Change (Nom.)"] / df["Nominal Property Value"].shift(1) * 100).fillna(0).round(2)
-
-    return AmortResult(
+    
+    df = pd.DataFrame(yearly_data)
+    
+    # Calculate year-over-year changes
+    df["YoY Property Change (Act.)"] = df["Property (Actualized)"].diff().fillna(0)
+    df["YoY Net Net Change (Act.)"] = df["Net Net (Actualized)"].diff().fillna(0)
+    
+    # Calculate the values at loan end for the return object
+    loan_end_data = df[df["Year"] == loan_years].iloc[0]
+    
+    return LoanMetrics(
         df=df,
         monthly_payment=monthly_payment,
-        total_int_nom=cumul_interest,
-        total_int_act=cumul_interest_act,
-        total_cap_act=cumul_principal_act,
-        total_rent_nom=cumul_rent_nom,
-        total_rent_act=cumul_rent_act,
-        total_charges_nom=cumul_charges_nom,
-        total_charges_act=cumul_charges_act,
+        total_interest_nominal=loan_end_data["Cumul. Interest (Nominal)"],
+        total_cost_nominal=loan_amount + loan_end_data["Cumul. Interest (Nominal)"],
+        total_interest_actualized=loan_end_data["Cumul. Interest (Actualized)"],
+        total_principal_actualized=cumul_principal_act if year <= loan_years else df[df["Year"] == loan_years]["Total Paid (Actualized)"].values[0] - df[df["Year"] == loan_years]["Cumul. Interest (Actualized)"].values[0],
+        total_cost_actualized=loan_end_data["Total Paid (Actualized)"],
+        total_rent_nominal=loan_end_data["Cumul. Rent (Nominal)"],
+        total_rent_actualized=loan_end_data["Cumul. Rent (Actualized)"],
+        total_charges_nominal=loan_end_data["Cumul. Charges (Nominal)"],
+        total_charges_actualized=loan_end_data["Cumul. Charges (Actualized)"],
     )
 
 
 @st.cache_data
-def find_optimal_exit(df: pd.DataFrame, loan_years: int) -> dict:
-    """Find optimal exit points based on various metrics."""
+def analyze_exit_strategy(df: pd.DataFrame, loan_years: int, inflation_rate: float, real_estate_growth: float) -> ExitAnalysis:
+    """Determine optimal exit points and erosion metrics."""
+    
     # Peak actualized property value
-    peak_act_idx = df["Actualized Property Value"].idxmax()
-    peak_act_year = df.loc[peak_act_idx, "Year"]
-    peak_act_value = df.loc[peak_act_idx, "Actualized Property Value"]
-
-    # Peak net net actualized
-    peak_net_net_idx = df["Net Net Real Estate (Act.)"].idxmax()
-    peak_net_net_year = df.loc[peak_net_net_idx, "Year"]
-    peak_net_net_value = df.loc[peak_net_net_idx, "Net Net Real Estate (Act.)"]
-
-    # First year where actualized value decreases
-    df_after_loan = df[df["Year"] > loan_years]
-    declining_years = df_after_loan[df_after_loan["YoY Property Change (Act.)"] < 0]
-    first_decline_year = declining_years["Year"].iloc[0] if not declining_years.empty else None
-
-    # Years where actualized return goes negative
-    negative_return_years = df[df["Actualized Annual Return (%)"] < 0]
-    first_negative_return = negative_return_years["Year"].iloc[0] if not negative_return_years.empty else None
-
-    return {
-        "peak_act_year": peak_act_year,
-        "peak_act_value": peak_act_value,
-        "peak_net_net_year": peak_net_net_year,
-        "peak_net_net_value": peak_net_net_value,
-        "first_decline_year": first_decline_year,
-        "first_negative_return": first_negative_return,
-    }
+    peak_idx = df["Property (Actualized)"].idxmax()
+    peak_year = int(df.loc[peak_idx, "Year"])
+    peak_value = df.loc[peak_idx, "Property (Actualized)"]
+    
+    # Peak net net
+    peak_net_net_idx = df["Net Net (Actualized)"].idxmax()
+    peak_net_net_year = int(df.loc[peak_net_net_idx, "Year"])
+    peak_net_net_value = df.loc[peak_net_net_idx, "Net Net (Actualized)"]
+    
+    # First decline year (after loan)
+    post_loan = df[df["Year"] > loan_years]
+    declining = post_loan[post_loan["YoY Property Change (Act.)"] < 0]
+    first_decline = int(declining["Year"].iloc[0]) if not declining.empty else None
+    
+    # Annual erosion rate after loan
+    annual_erosion = inflation_rate - real_estate_growth
+    
+    return ExitAnalysis(
+        peak_value_year=peak_year,
+        peak_value_amount=peak_value,
+        peak_net_net_year=peak_net_net_year,
+        peak_net_net_amount=peak_net_net_value,
+        first_decline_year=first_decline,
+        annual_erosion_rate=annual_erosion,
+    )
 
 
 @st.cache_data
-def compute_sensitivity_rate(
-    property_value: float,
-    loan_amount: float,
-    loan_years: int,
-    inflation_rate: float,
-    real_estate_inflation: float,
-    initial_rent: float,
-    property_tax: float,
-    occupancy_rate: float,
-    stock_return: float,
-    down_payment: float,
+def compute_rate_sensitivity(
+    property_value: float, loan_amount: float, loan_years: int,
+    inflation_rate: float, real_estate_growth: float, monthly_rent: float,
+    property_tax: float, occupancy_rate: float, stock_return: float, down_payment: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    rate_range = np.linspace(0, 15, 100)
-    net_vals, net_net_vals = [], []
-
-    final_act_value = property_value * ((1 + real_estate_inflation / 100) ** loan_years) / ((1 + inflation_rate / 100) ** loan_years)
-
-    for r in rate_range:
-        res = calculate_amortization(
-            property_value, loan_amount, r, loan_years, loan_years, inflation_rate,
-            real_estate_inflation, initial_rent, property_tax,
+    """Sensitivity analysis for interest rate variations."""
+    rates = np.linspace(0, 15, 100)
+    net_values, net_net_values = [], []
+    
+    final_property_act = property_value * ((1 + real_estate_growth / 100) ** loan_years) / ((1 + inflation_rate / 100) ** loan_years)
+    
+    for rate in rates:
+        result = calculate_loan_amortization(
+            property_value, loan_amount, rate, loan_years, loan_years,
+            inflation_rate, real_estate_growth, monthly_rent, property_tax,
             occupancy_rate, stock_return, down_payment
         )
-        net_vals.append(final_act_value - (res.total_int_act + res.total_cap_act))
-        net_net_vals.append((final_act_value + res.total_rent_act) - (res.total_int_act + res.total_cap_act + res.total_charges_act))
-
-    return rate_range, np.array(net_vals), np.array(net_net_vals)
-
-
-@st.cache_data
-def compute_sensitivity_market(
-    property_value: float,
-    loan_years: int,
-    inflation_rate: float,
-    total_cost_act: float,
-    total_rent_act: float,
-    total_charges_act: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    market_range = np.linspace(-5, 15, 100)
-    inf_denom = (1 + inflation_rate / 100) ** loan_years
-
-    final_act_value = property_value * ((1 + market_range / 100) ** loan_years) / inf_denom
-    net_vals = final_act_value - total_cost_act
-    net_net_vals = (final_act_value + total_rent_act) - (total_cost_act + total_charges_act)
-
-    return market_range, net_vals, net_net_vals
+        net_values.append(final_property_act - result.total_cost_actualized)
+        net_net_values.append(
+            (final_property_act + result.total_rent_actualized) - 
+            (result.total_cost_actualized + result.total_charges_actualized)
+        )
+    
+    return rates, np.array(net_values), np.array(net_net_values)
 
 
 @st.cache_data
-def compute_sensitivity_inflation(
-    property_value: float,
-    loan_amount: float,
-    annual_rate: float,
-    loan_years: int,
-    real_estate_inflation: float,
-    initial_rent: float,
-    property_tax: float,
-    occupancy_rate: float,
-    stock_return: float,
-    down_payment: float,
+def compute_market_sensitivity(
+    property_value: float, loan_years: int, inflation_rate: float,
+    total_cost_act: float, total_rent_act: float, total_charges_act: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    inf_range = np.linspace(0, 10, 100)
-    net_vals, net_net_vals = [], []
+    """Sensitivity analysis for real estate market variations."""
+    market_rates = np.linspace(-5, 15, 100)
+    denominator = (1 + inflation_rate / 100) ** loan_years
+    
+    final_values = property_value * ((1 + market_rates / 100) ** loan_years) / denominator
+    net_values = final_values - total_cost_act
+    net_net_values = (final_values + total_rent_act) - (total_cost_act + total_charges_act)
+    
+    return market_rates, net_values, net_net_values
 
-    immo_growth = (1 + real_estate_inflation / 100) ** loan_years
 
-    for i in inf_range:
-        res = calculate_amortization(
-            property_value, loan_amount, annual_rate, loan_years, loan_years, i,
-            real_estate_inflation, initial_rent, property_tax,
+@st.cache_data
+def compute_inflation_sensitivity(
+    property_value: float, loan_amount: float, annual_rate: float, loan_years: int,
+    real_estate_growth: float, monthly_rent: float, property_tax: float,
+    occupancy_rate: float, stock_return: float, down_payment: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sensitivity analysis for inflation rate variations."""
+    inflation_rates = np.linspace(0, 10, 100)
+    net_values, net_net_values = [], []
+    
+    property_growth = (1 + real_estate_growth / 100) ** loan_years
+    
+    for inf_rate in inflation_rates:
+        result = calculate_loan_amortization(
+            property_value, loan_amount, annual_rate, loan_years, loan_years,
+            inf_rate, real_estate_growth, monthly_rent, property_tax,
             occupancy_rate, stock_return, down_payment
         )
-        final_act_value = property_value * immo_growth / ((1 + i / 100) ** loan_years)
-        net_vals.append(final_act_value - (res.total_int_act + res.total_cap_act))
-        net_net_vals.append((final_act_value + res.total_rent_act) - (res.total_int_act + res.total_cap_act + res.total_charges_act))
+        final_property_act = property_value * property_growth / ((1 + inf_rate / 100) ** loan_years)
+        net_values.append(final_property_act - result.total_cost_actualized)
+        net_net_values.append(
+            (final_property_act + result.total_rent_actualized) - 
+            (result.total_cost_actualized + result.total_charges_actualized)
+        )
+    
+    return inflation_rates, np.array(net_values), np.array(net_net_values)
 
-    return inf_range, np.array(net_vals), np.array(net_net_vals)
 
-
-def create_donut(labels: list, values: list, title: str) -> go.Figure:
-    fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=0.5, marker_colors=["#00CC96", "#EF553B"])])
+# =============================================================================
+# CHART BUILDERS
+# =============================================================================
+def create_donut_chart(labels: list, values: list, title: str, colors: list = None) -> go.Figure:
+    """Create a donut chart for breakdown visualization."""
+    if colors is None:
+        colors = ["#28a745", "#dc3545"]
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        hole=0.5,
+        marker_colors=colors,
+        textinfo="label+percent",
+        textposition="outside"
+    )])
     fig.update_layout(
-        title=dict(text=title, x=0.5),
-        margin=dict(t=50, b=20),
+        title=dict(text=title, x=0.5, font=dict(size=16)),
+        margin=dict(t=60, b=20, l=20, r=20),
         height=350,
-        showlegend=True,
+        showlegend=False,
         paper_bgcolor="rgba(0,0,0,0)",
     )
     return fig
 
 
-def create_sensitivity_chart(x: np.ndarray, y_net: np.ndarray, y_net_net: np.ndarray, title: str, color: str) -> go.Figure:
+def create_sensitivity_chart(x: np.ndarray, y_net: np.ndarray, y_net_net: np.ndarray, 
+                             title: str, x_label: str, color: str) -> go.Figure:
+    """Create sensitivity analysis chart with inflection points."""
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=y_net, name="Net", line=dict(color=color, dash="dot")))
-    fig.add_trace(go.Scatter(x=x, y=y_net_net, name="Net Net", line=dict(color=color, width=4)))
-    fig.add_hline(y=0, line_dash="dash")
+    
+    fig.add_trace(go.Scatter(
+        x=x, y=y_net,
+        name="Net (Equity only)",
+        line=dict(color=color, dash="dot", width=2)
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=y_net_net,
+        name="Net Net (Total)",
+        line=dict(color=color, width=4)
+    ))
+    
+    fig.add_hline(y=0, line_dash="dash", line_color="black", opacity=0.5)
+    
+    # Mark inflection points
+    net_inflection_idx = np.argmin(np.abs(y_net))
+    net_net_inflection_idx = np.argmin(np.abs(y_net_net))
+    
+    fig.add_vline(x=x[net_inflection_idx], line_dash="dot", line_color="gray", opacity=0.5)
+    fig.add_vline(x=x[net_net_inflection_idx], line_dash="dot", line_color=color, opacity=0.7)
+    
     fig.update_layout(
-        title=title,
-        xaxis_title="(%)",
+        title=dict(text=title, font=dict(size=14)),
+        xaxis_title=x_label,
+        yaxis_title="Gain (€)",
         height=400,
-        legend=dict(orientation="h", y=-0.2),
+        legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
         paper_bgcolor="rgba(0,0,0,0)",
+        hovermode="x unified"
     )
     return fig
 
 
-# --- SIDEBAR ---
+def create_main_evolution_chart(df: pd.DataFrame, loan_years: int) -> go.Figure:
+    """Create the main property value evolution chart."""
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+        row_heights=[0.7, 0.3],
+        subplot_titles=(
+            "📈 Property Value: Nominal vs Real (Actualized)",
+            "📊 Year-over-Year Change in Real Value"
+        )
+    )
+    
+    # Top: Property values
+    fig.add_trace(go.Scatter(
+        x=df["Year"], y=df["Property (Nominal)"],
+        name="Nominal (Paper Value)",
+        line=dict(color="#3498db", width=3),
+        hovertemplate="Year %{x}<br>Nominal: €%{y:,.0f}<extra></extra>"
+    ), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(
+        x=df["Year"], y=df["Property (Actualized)"],
+        name="Actualized (Real Value)",
+        line=dict(color="#9b59b6", width=4),
+        hovertemplate="Year %{x}<br>Real: €%{y:,.0f}<extra></extra>"
+    ), row=1, col=1)
+    
+    # Mark peak
+    peak_idx = df["Property (Actualized)"].idxmax()
+    peak_year = df.loc[peak_idx, "Year"]
+    peak_value = df.loc[peak_idx, "Property (Actualized)"]
+    
+    fig.add_trace(go.Scatter(
+        x=[peak_year], y=[peak_value],
+        mode="markers+text",
+        name="Peak Real Value",
+        marker=dict(size=15, color="#e74c3c", symbol="star"),
+        text=["PEAK"],
+        textposition="top center",
+        textfont=dict(color="#e74c3c", size=12, weight="bold"),
+        hovertemplate=f"Peak at Year {peak_year}<br>€{peak_value:,.0f}<extra></extra>"
+    ), row=1, col=1)
+    
+    # Bottom: YoY changes
+    colors = ["#28a745" if v >= 0 else "#dc3545" for v in df["YoY Property Change (Act.)"]]
+    fig.add_trace(go.Bar(
+        x=df["Year"], y=df["YoY Property Change (Act.)"],
+        name="YoY Change",
+        marker_color=colors,
+        hovertemplate="Year %{x}<br>Change: €%{y:,.0f}<extra></extra>",
+        showlegend=False
+    ), row=2, col=1)
+    
+    fig.add_hline(y=0, line_color="black", line_width=1, row=2, col=1)
+    
+    # Loan end marker
+    fig.add_vline(x=loan_years, line_dash="dash", line_color="#e74c3c", line_width=2)
+    fig.add_annotation(
+        x=loan_years, y=df["Property (Nominal)"].max(),
+        text="🏦 LOAN ENDS",
+        showarrow=True, arrowhead=2,
+        ax=50, ay=-30,
+        font=dict(color="#e74c3c", size=12, weight="bold"),
+        bgcolor="white", bordercolor="#e74c3c", borderwidth=2
+    )
+    
+    fig.update_layout(
+        height=600,
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+        hovermode="x unified"
+    )
+    fig.update_yaxes(title_text="Value (€)", row=1, col=1)
+    fig.update_yaxes(title_text="Change (€)", row=2, col=1)
+    fig.update_xaxes(title_text="Year", row=2, col=1)
+    
+    return fig
+
+
+def create_loan_cost_comparison_chart(df: pd.DataFrame, loan_amount: float, loan_years: int) -> go.Figure:
+    """Chart showing nominal vs actualized loan cost over time."""
+    df_loan = df[df["Year"] <= loan_years].copy()
+    
+    fig = go.Figure()
+    
+    # Nominal cost line (what you pay on paper)
+    fig.add_trace(go.Scatter(
+        x=df_loan["Year"], y=df_loan["Total Paid (Nominal)"],
+        name="Nominal Cost (What You Pay)",
+        line=dict(color="#e74c3c", width=3),
+        fill="tozeroy",
+        fillcolor="rgba(231, 76, 60, 0.1)"
+    ))
+    
+    # Actualized cost line (real cost)
+    fig.add_trace(go.Scatter(
+        x=df_loan["Year"], y=df_loan["Total Paid (Actualized)"],
+        name="Real Cost (Purchasing Power)",
+        line=dict(color="#27ae60", width=3),
+        fill="tozeroy",
+        fillcolor="rgba(39, 174, 96, 0.1)"
+    ))
+    
+    # Original loan amount reference
+    fig.add_hline(
+        y=loan_amount, 
+        line_dash="dash", 
+        line_color="#3498db",
+        annotation_text=f"Original Loan: €{format_currency(loan_amount)}",
+        annotation_position="right"
+    )
+    
+    fig.update_layout(
+        title=dict(
+            text="💸 Inflation Erodes Your Loan Cost Over Time",
+            font=dict(size=18)
+        ),
+        xaxis_title="Year",
+        yaxis_title="Cumulative Cost (€)",
+        height=450,
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+        hovermode="x unified"
+    )
+    
+    return fig
+
+
+def create_bank_perspective_chart(df: pd.DataFrame, loan_amount: float, loan_years: int) -> go.Figure:
+    """Chart showing the bank's perspective - their real return."""
+    df_loan = df[df["Year"] <= loan_years].copy()
+    
+    # Bank's nominal receipts vs real value
+    fig = go.Figure()
+    
+    # What bank receives (nominal)
+    fig.add_trace(go.Scatter(
+        x=df_loan["Year"], y=df_loan["Total Paid (Nominal)"],
+        name="Bank Receives (Nominal)",
+        line=dict(color="#3498db", width=3)
+    ))
+    
+    # What it's actually worth
+    fig.add_trace(go.Scatter(
+        x=df_loan["Year"], y=df_loan["Total Paid (Actualized)"],
+        name="Actually Worth (Real)",
+        line=dict(color="#e74c3c", width=3, dash="dash")
+    ))
+    
+    # Bank's loss area
+    fig.add_trace(go.Scatter(
+        x=df_loan["Year"].tolist() + df_loan["Year"].tolist()[::-1],
+        y=df_loan["Total Paid (Nominal)"].tolist() + df_loan["Total Paid (Actualized)"].tolist()[::-1],
+        fill="toself",
+        fillcolor="rgba(46, 204, 113, 0.3)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="Bank's Loss (Your Gain)",
+        hoverinfo="skip"
+    ))
+    
+    fig.update_layout(
+        title=dict(
+            text="🏦 Bank's Perspective: What They Receive vs What It's Worth",
+            font=dict(size=16)
+        ),
+        xaxis_title="Year",
+        yaxis_title="Amount (€)",
+        height=400,
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+        hovermode="x unified"
+    )
+    
+    return fig
+
+
+def create_post_loan_erosion_chart(df: pd.DataFrame, loan_years: int) -> go.Figure:
+    """Chart focusing on value erosion after loan ends."""
+    
+    fig = go.Figure()
+    
+    # Full timeline
+    fig.add_trace(go.Scatter(
+        x=df["Year"], y=df["Property (Actualized)"],
+        name="Real Property Value",
+        line=dict(color="#9b59b6", width=3)
+    ))
+    
+    # Highlight post-loan period
+    df_post = df[df["Year"] >= loan_years]
+    fig.add_trace(go.Scatter(
+        x=df_post["Year"], y=df_post["Property (Actualized)"],
+        name="Post-Loan Period",
+        line=dict(color="#e74c3c", width=4),
+        fill="tozeroy",
+        fillcolor="rgba(231, 76, 60, 0.1)"
+    ))
+    
+    # Loan end marker
+    loan_end_value = df[df["Year"] == loan_years]["Property (Actualized)"].values[0]
+    fig.add_vline(x=loan_years, line_dash="dash", line_color="#2c3e50", line_width=2)
+    
+    fig.add_annotation(
+        x=loan_years, y=loan_end_value,
+        text=f"Loan Ends<br>Value: €{format_currency(loan_end_value)}",
+        showarrow=True, arrowhead=2,
+        ax=-80, ay=-40,
+        bgcolor="white", bordercolor="#2c3e50"
+    )
+    
+    # End value annotation
+    end_value = df["Property (Actualized)"].iloc[-1]
+    end_year = df["Year"].iloc[-1]
+    
+    fig.add_annotation(
+        x=end_year, y=end_value,
+        text=f"Year {end_year}<br>Value: €{format_currency(end_value)}",
+        showarrow=True, arrowhead=2,
+        ax=-60, ay=30,
+        bgcolor="white", bordercolor="#e74c3c"
+    )
+    
+    fig.update_layout(
+        title=dict(
+            text="⚠️ Without Loan Leverage, Real Value Erodes",
+            font=dict(size=16)
+        ),
+        xaxis_title="Year",
+        yaxis_title="Real Property Value (€)",
+        height=400,
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=-0.15),
+        hovermode="x unified"
+    )
+    
+    return fig
+
+
+# =============================================================================
+# SIDEBAR
+# =============================================================================
 with st.sidebar:
-    st.header("🏠 Your Project")
-    property_value = st.number_input("Property Value (€)", value=250000, step=5000)
-    down_payment = st.number_input("Down Payment (€)", value=50000, step=1000)
+    st.title("⚙️ Parameters")
+    
+    st.header("🏠 Property")
+    property_value = st.number_input("Property Value (€)", value=250_000, step=5_000, format="%d")
+    down_payment = st.number_input("Down Payment (€)", value=50_000, step=1_000, format="%d")
     loan_amount = property_value - down_payment
-    st.info(f"Loan Amount: **{fmt(loan_amount)} €**")
-
+    
+    if loan_amount > 0:
+        st.success(f"**Loan Amount: €{format_currency(loan_amount)}**")
+    else:
+        st.error("Down payment exceeds property value!")
+    
     st.divider()
-    st.header("💳 Loan Parameters")
-    annual_rate = st.slider("Annual Interest Rate (%)", 0.0, 10.0, 3.5, step=0.1)
-    loan_years = st.number_input("Loan Duration (years)", value=20, min_value=1, max_value=40)
-
+    
+    st.header("💳 Loan Terms")
+    annual_rate = st.slider("Interest Rate (%/year)", 0.0, 10.0, 3.5, 0.1)
+    loan_years = st.number_input("Loan Duration (years)", value=20, min_value=5, max_value=30)
+    
     st.divider()
-    st.header("📊 Projection Horizon")
+    
+    st.header("🔮 Projection")
     projection_years = st.slider(
-        "Projection Duration (years)",
+        "Analysis Horizon (years)",
         min_value=int(loan_years),
         max_value=40,
         value=min(int(loan_years) + 15, 40),
-        help="Extend beyond loan term to see how inflation erodes value over time"
+        help="Extend beyond loan to see post-loan value erosion"
     )
-
+    
     st.divider()
-    st.header("💰 Income & Expenses")
-    initial_rent = st.number_input("Initial Monthly Rent (€)", value=1000, step=50)
+    
+    st.header("💰 Rental Income")
+    monthly_rent = st.number_input("Monthly Rent (€)", value=1_000, step=50, format="%d")
     occupancy_rate = st.slider("Occupancy Rate (%)", 0, 100, 95)
-    property_tax = st.number_input("Annual Property Tax (€)", value=1200, step=100)
-
+    property_tax = st.number_input("Annual Property Tax (€)", value=1_200, step=100, format="%d")
+    
     st.divider()
-    st.header("📈 Stock Market Return")
-    stock_return = st.slider("Annual Stock Return (%)", 0.0, 15.0, 7.0, step=0.1, help="Expected average annual return.")
+    
+    st.header("📊 Economic Assumptions")
+    inflation_rate = st.slider("General Inflation (%/year)", 0.0, 10.0, 2.5, 0.1)
+    real_estate_growth = st.slider("Real Estate Growth (%/year)", -5.0, 10.0, 1.5, 0.1)
+    stock_return = st.slider("Stock Market Return (%/year)", 0.0, 15.0, 7.0, 0.1)
 
-    st.divider()
-    st.header("📊 Economic Context")
-    inflation_rate = st.slider("Expected Annual Inflation (%)", 0.0, 10.0, 2.0, step=0.1)
-    real_estate_inflation = st.slider("Real Estate Appreciation (%/year)", -5.0, 10.0, 1.5, step=0.1)
 
-# --- MAIN PAGE ---
-st.title("🚀 Credit Analysis: Nominal vs Purchasing Power")
+# =============================================================================
+# MAIN PAGE
+# =============================================================================
+st.title("🏦 Leverage vs Inflation Erosion")
+st.markdown("**Understand how loans protect you from inflation — and what happens when they end.**")
 
-if loan_amount > 0:
-    result = calculate_amortization(
-        property_value, loan_amount, annual_rate, int(loan_years), projection_years,
-        inflation_rate, real_estate_inflation, initial_rent, property_tax,
-        occupancy_rate, stock_return, down_payment
-    )
-    df = result.df
-    exit_analysis = find_optimal_exit(df, int(loan_years))
+if loan_amount <= 0:
+    st.error("Please adjust your inputs: down payment exceeds property value.")
+    st.stop()
 
-    # Values at loan end
-    df_at_loan_end = df[df["Year"] == loan_years].iloc[0]
-    final_nom_at_loan = df_at_loan_end["Nominal Property Value"]
-    final_act_at_loan = df_at_loan_end["Actualized Property Value"]
-    total_cost_act = result.total_cap_act + result.total_int_act
+# Run calculations
+metrics = calculate_loan_amortization(
+    property_value, loan_amount, annual_rate, int(loan_years), projection_years,
+    inflation_rate, real_estate_growth, monthly_rent, property_tax,
+    occupancy_rate, stock_return, down_payment
+)
+df = metrics.df
+exit_info = analyze_exit_strategy(df, int(loan_years), inflation_rate, real_estate_growth)
 
-    # Values at projection end
-    final_nom = df["Nominal Property Value"].iloc[-1]
-    final_act = df["Actualized Property Value"].iloc[-1]
+# Get key values
+loan_end_row = df[df["Year"] == loan_years].iloc[0]
+final_row = df.iloc[-1]
 
-    net_balance_at_loan = final_act_at_loan - total_cost_act
-    net_net_at_loan = df_at_loan_end["Net Net Real Estate (Act.)"]
+# =============================================================================
+# KEY INSIGHT BOXES
+# =============================================================================
+st.markdown("---")
 
-    # Value erosion after loan
-    value_erosion = final_act_at_loan - final_act if projection_years > loan_years else 0
+# Calculate bank's loss/gain
+bank_nominal_receipts = metrics.total_cost_nominal
+bank_real_value = metrics.total_cost_actualized
+bank_loss = bank_nominal_receipts - bank_real_value
+bank_loss_pct = (bank_loss / bank_nominal_receipts) * 100
 
-    # SECTION 1: QUICK SUMMARY
-    st.subheader("📊 Financial Summary")
+col1, col2 = st.columns(2)
 
-    box_class = "box-positive" if net_net_at_loan > 0 else "box-negative"
-    st.markdown(f"""
-    <div class="highlight-box {box_class}">
-        <div style="display: flex; justify-content: space-around; align-items: center;">
-            <div>
-                <h3 style='margin:0; color:#4b4b4b; font-size: 1.1em;'>Net Balance (Equity)</h3>
-                <h2 style='margin:0; color:#1f1f1f;'>{round(net_balance_at_loan, 0):,} €</h2>
-            </div>
-            <div style="width: 2px; height: 50px; background-color: #d0d0d0;"></div>
-            <div>
-                <h3 style='margin:0; color:#4b4b4b; font-size: 1.1em;'>Net Net Gain (Total)</h3>
-                <h2 style='margin:0; color:#1f1f1f;'>{round(net_net_at_loan, 0):,} €</h2>
-            </div>
+with col1:
+    # Does the bank lose money?
+    if bank_real_value < loan_amount:
+        actual_loss = loan_amount - bank_real_value
+        st.markdown(f"""
+        <div class="bank-loss-box">
+            <h3 style="margin:0; color: rgba(255,255,255,0.9);">🎉 THE BANK LOSES MONEY</h3>
+            <h2>€{format_currency(actual_loss)}</h2>
+            <p>The real value of what they receive (€{format_currency(bank_real_value)}) is <b>LESS</b> than what they lent you (€{format_currency(loan_amount)})!</p>
         </div>
-        <p style='margin-top:15px; color:#4b4b4b; font-style: italic;'>
-            <b>Net Net</b> includes rental income ({occupancy_rate}% occupancy) and expenses over {loan_years} years (actualized at loan end).
-        </p>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="key-insight">
+            <h3 style="margin:0; color: rgba(255,255,255,0.9);">💸 INFLATION SAVINGS</h3>
+            <h2>€{format_currency(bank_loss)}</h2>
+            <p>You save {bank_loss_pct:.1f}% thanks to inflation eroding your debt!</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+with col2:
+    # Post-loan erosion warning
+    if exit_info.annual_erosion_rate > 0:
+        value_at_loan_end = loan_end_row["Property (Actualized)"]
+        value_at_projection_end = final_row["Property (Actualized)"]
+        erosion_amount = value_at_loan_end - value_at_projection_end
+        
+        st.markdown(f"""
+        <div class="erosion-warning">
+            <h3 style="margin:0; color: rgba(255,255,255,0.9);">⚠️ POST-LOAN VALUE EROSION</h3>
+            <h2>-{exit_info.annual_erosion_rate:.1f}%/year</h2>
+            <p>After the loan ends, you lose €{format_currency(erosion_amount)} in real value over {projection_years - loan_years} years!</p>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="key-insight">
+            <h3 style="margin:0; color: rgba(255,255,255,0.9);">✅ POSITIVE REAL RETURN</h3>
+            <h2>+{abs(exit_info.annual_erosion_rate):.1f}%/year</h2>
+            <p>Real estate growth exceeds inflation — your property gains real value over time!</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+# =============================================================================
+# SUMMARY METRICS
+# =============================================================================
+st.markdown("---")
+st.subheader("📊 Financial Summary at Loan End")
+
+col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+
+col_m1.metric(
+    "Monthly Payment",
+    f"€{format_currency(metrics.monthly_payment)}",
+)
+col_m2.metric(
+    "Total Interest (Nominal)",
+    f"€{format_currency(metrics.total_interest_nominal)}",
+)
+col_m3.metric(
+    "Total Cost (Nominal)",
+    f"€{format_currency(metrics.total_cost_nominal)}",
+)
+col_m4.metric(
+    "Total Cost (Real)",
+    f"€{format_currency(metrics.total_cost_actualized)}",
+    delta=f"-€{format_currency(bank_loss)} saved",
+    delta_color="normal"
+)
+col_m5.metric(
+    "Peak Real Value Year",
+    f"Year {exit_info.peak_value_year}",
+    help="Best year to sell for maximum real value"
+)
+
+# =============================================================================
+# TABS
+# =============================================================================
+st.markdown("---")
+
+tabs = st.tabs([
+    "🎯 Key Insight: Loan as Shield",
+    "📉 Post-Loan Erosion",
+    "🏦 Bank's Perspective",
+    "⚖️ Nominal vs Real",
+    "📈 Full Evolution",
+    "💰 Rent & Charges",
+    "📊 Stock Comparison",
+    "🔍 Sensitivity",
+    "📑 Data"
+])
+
+# TAB 1: LOAN AS INFLATION SHIELD
+with tabs[0]:
+    st.subheader("🎯 The Loan is Your Inflation Shield")
+    
+    st.markdown("""
+    <div class="insight-box" style="text-align: left; padding: 20px; background-color: #e8f4fd; border-left: 5px solid #3498db; border-radius: 8px;">
+    <h4>🔑 Key Concept: Why Borrowers Win Against Inflation</h4>
+    
+    When you take a loan, your monthly payment is <b>fixed in nominal terms</b>. But inflation makes each euro worth less over time.
+    
+    <b>Result:</b> You repay the bank with money that has less purchasing power than when you borrowed it.
+    
+    <ul>
+        <li>Year 1: Your €1,000 payment = €1,000 in today's money</li>
+        <li>Year 10: Your €1,000 payment = ~€820 in today's money (at 2% inflation)</li>
+        <li>Year 20: Your €1,000 payment = ~€670 in today's money</li>
+    </ul>
+    
+    <b>The bank gets the same number of euros, but those euros buy less.</b>
     </div>
     """, unsafe_allow_html=True)
-
-    col_a, col_b, col_c, col_d, col_e = st.columns(5)
-    col_a.metric("Monthly Payment", f"{fmt(result.monthly_payment)} €")
-    col_b.metric("Total Interest", f"{fmt(result.total_int_nom)} €")
-    col_c.metric("Total Nominal Cost", f"{fmt(loan_amount + result.total_int_nom)} €")
-    col_d.metric("Property Value (Nominal)", f"{fmt(final_nom_at_loan)} €")
-    col_e.metric("Inflation Gain", f"{fmt((loan_amount + result.total_int_nom) - total_cost_act)} €")
-
+    
+    # Main chart: Loan cost erosion
+    st.plotly_chart(
+        create_loan_cost_comparison_chart(df, loan_amount, int(loan_years)),
+        use_container_width=True
+    )
+    
+    # Comparison metrics
+    col_a, col_b, col_c = st.columns(3)
+    
+    col_a.metric(
+        "You Pay (Nominal)",
+        f"€{format_currency(metrics.total_cost_nominal)}",
+        help="Total euros you hand over"
+    )
+    col_b.metric(
+        "Actually Costs You (Real)",
+        f"€{format_currency(metrics.total_cost_actualized)}",
+        help="Real purchasing power transferred"
+    )
+    col_c.metric(
+        "Your Inflation Gain",
+        f"€{format_currency(bank_loss)}",
+        delta=f"{bank_loss_pct:.1f}% saved",
+        help="Difference between nominal and real cost"
+    )
+    
+    # Does bank lose money?
     st.markdown("---")
-    st.write("💡 **Actualized View at Loan End (Today's Purchasing Power):**")
-    col_f, col_g, col_h, col_i, col_j = st.columns(5)
-    col_f.metric("Real Credit Cost", f"{fmt(total_cost_act)} €")
-    col_g.metric("Real Property Value", f"{fmt(final_act_at_loan)} €")
-    col_h.metric("Net Balance (Equity)", f"{fmt(net_balance_at_loan)} €")
-    col_i.metric("Net Net Gain (Total)", f"{fmt(net_net_at_loan)} €")
-
-    df_crossover = df[df["Cumul. Repayment (Actualized)"] > df["Actualized Property Value"]]
-    crossover_year = df_crossover["Year"].iloc[0] if not df_crossover.empty else "Never"
-    col_j.metric("Crossover Year", f"Year {crossover_year}" if isinstance(crossover_year, int) else crossover_year)
-
-    # SECTION 2: VISUALIZATIONS
-    st.divider()
-
-    tab_inflection, tab_nominal_vs_real, tab_global, tab_annual, tab_rent, tab_waterfall, tab_stock, tab_sensitivity, tab_data = st.tabs([
-        "🎯 Inflection Point",
-        "⚖️ Nominal vs Real",
-        "🌎 Global View",
-        "📅 Annual Evolution",
-        "💰 Rent & Expenses",
-        "🏆 Net Net Breakdown",
-        "📈 Stock vs Real Estate",
-        "🔍 Sensitivity Analysis",
-        "📑 Data Table",
-    ])
-
-    # NEW TAB: INFLECTION POINT ANALYSIS
-    with tab_inflection:
-        st.subheader("🎯 The Inflection Point: When Real Value Starts Declining")
-
-        st.markdown("""
-        <div class="insight-box">
-        <b>Key Insight:</b> During your loan, you benefit from <b>leverage</b> — you're repaying debt with money that's worth less each year.
-        Once the loan ends, this advantage disappears. If real estate appreciation is lower than inflation, your property's 
-        <b>real purchasing power decreases every year</b>.
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Key metrics
-        col_peak1, col_peak2, col_peak3, col_peak4 = st.columns(4)
-
-        col_peak1.metric(
-            "📍 Peak Real Value Year",
-            f"Year {exit_analysis['peak_act_year']}",
-            help="Year when actualized property value reaches maximum"
-        )
-        col_peak2.metric(
-            "💰 Peak Real Value",
-            f"{fmt(exit_analysis['peak_act_value'])} €",
-            help="Maximum actualized property value"
-        )
-        col_peak3.metric(
-            "🏆 Peak Net Net Year",
-            f"Year {exit_analysis['peak_net_net_year']}",
-            help="Year when total actualized gain (including rent) is maximum"
-        )
-        col_peak4.metric(
-            "📉 First Decline Year",
-            f"Year {exit_analysis['first_decline_year']}" if exit_analysis['first_decline_year'] else "Never",
-            help="First year when actualized value drops YoY"
-        )
-
-        st.divider()
-
-        # Main inflection chart
-        st.subheader("Property Value: Nominal vs Actualized Over Time")
-
-        fig_inflection = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.08,
-            row_heights=[0.65, 0.35],
-            subplot_titles=("Property Value Evolution", "Year-over-Year Change (Actualized)")
-        )
-
-        # Top chart: Values
-        fig_inflection.add_trace(
-            go.Scatter(x=df["Year"], y=df["Nominal Property Value"], mode="lines",
-                       name="Nominal Value", line=dict(color="#636EFA", width=3)),
-            row=1, col=1
-        )
-        fig_inflection.add_trace(
-            go.Scatter(x=df["Year"], y=df["Actualized Property Value"], mode="lines",
-                       name="Actualized Value", line=dict(color="#AB63FA", width=4)),
-            row=1, col=1
-        )
-
-        # Add peak marker
-        fig_inflection.add_trace(
-            go.Scatter(
-                x=[exit_analysis['peak_act_year']],
-                y=[exit_analysis['peak_act_value']],
-                mode="markers+text",
-                name="Peak Value",
-                marker=dict(size=15, color="#FF6B6B", symbol="star"),
-                text=["PEAK"],
-                textposition="top center",
-                textfont=dict(size=12, color="#FF6B6B")
-            ),
-            row=1, col=1
-        )
-
-        # Loan end line
-        fig_inflection.add_vline(x=loan_years, line_dash="dash", line_color="red", opacity=0.7, row=1, col=1)
-        fig_inflection.add_vline(x=loan_years, line_dash="dash", line_color="red", opacity=0.7, row=2, col=1)
-
-        # Bottom chart: YoY changes
-        colors_yoy = ["#00CC96" if v >= 0 else "#EF553B" for v in df["YoY Property Change (Act.)"]]
-        fig_inflection.add_trace(
-            go.Bar(x=df["Year"], y=df["YoY Property Change (Act.)"],
-                   name="YoY Change (Act.)", marker_color=colors_yoy, showlegend=False),
-            row=2, col=1
-        )
-        fig_inflection.add_hline(y=0, line_dash="solid", line_color="gray", row=2, col=1)
-
-        fig_inflection.update_layout(
-            height=650,
-            hovermode="x unified",
-            paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"),
-        )
-        fig_inflection.update_yaxes(title_text="Value (€)", row=1, col=1)
-        fig_inflection.update_yaxes(title_text="YoY Change (€)", row=2, col=1)
-        fig_inflection.update_xaxes(title_text="Year", row=2, col=1)
-
-        # Add annotations
-        fig_inflection.add_annotation(
-            x=loan_years, y=df[df["Year"] == loan_years]["Nominal Property Value"].values[0],
-            text="Loan Ends", showarrow=True, arrowhead=2, ax=40, ay=-40,
-            font=dict(color="red", size=11), row=1, col=1
-        )
-
-        st.plotly_chart(fig_inflection, use_container_width=True)
-
-        # Explanation
-        col_exp1, col_exp2 = st.columns(2)
-
-        with col_exp1:
-            st.markdown("### 📈 Why Nominal Keeps Rising")
-            st.markdown(f"""
-            The **nominal value** (blue line) keeps growing at **{real_estate_inflation}%/year** forever.
-            This is what you'd see in real estate listings — the "sticker price."
-
-            - Year 1: {fmt(property_value * (1 + real_estate_inflation/100))} €
-            - Year {loan_years}: {fmt(final_nom_at_loan)} €
-            - Year {projection_years}: {fmt(final_nom)} €
-
-            **But this is an illusion** — it doesn't account for what money is worth.
-            """)
-
-        with col_exp2:
-            st.markdown("### 📉 Why Actualized Peaks Then Falls")
-            st.markdown(f"""
-            The **actualized value** (purple line) shows **real purchasing power**.
-
-            **During the loan:** Your debt is eroded by inflation, giving you an edge.
-
-            **After the loan:** No more leverage benefit. Since RE appreciation ({real_estate_inflation}%)
-            < inflation ({inflation_rate}%), **real value declines by ~{round(inflation_rate - real_estate_inflation, 1)}%/year**.
-
-            - Peak at Year {exit_analysis['peak_act_year']}: {fmt(exit_analysis['peak_act_value'])} €
-            - Year {projection_years}: {fmt(final_act)} € (**-{fmt(exit_analysis['peak_act_value'] - final_act)} €**)
-            """)
-
-        st.divider()
-
-        # Strategic recommendations
-        st.subheader("🎯 Strategic Recommendations")
-
-        effective_real_return = real_estate_inflation - inflation_rate
-
-        if effective_real_return < 0:
-            st.error(f"""
-            ⚠️ **Alert: Negative Real Return ({round(effective_real_return, 1)}%/year)**
-
-            With RE appreciation ({real_estate_inflation}%) below inflation ({inflation_rate}%), 
-            your property loses **{fmt(abs(effective_real_return))}%** of real value each year after the loan.
-
-            **Optimal Strategy:**
-            1. **Sell near Year {exit_analysis['peak_act_year']}** to capture maximum real value
-            2. **Or refinance** to restart the leverage clock
-            3. **Or increase rent** above inflation to compensate
-
-            Holding past Year {exit_analysis['peak_act_year']} means losing ~{fmt(abs(effective_real_return) * final_act_at_loan / 100)} € of purchasing power per year.
-            """)
-        elif effective_real_return == 0:
-            st.warning(f"""
-            ⚡ **Neutral Real Return**
-
-            RE appreciation matches inflation — your property maintains purchasing power but doesn't grow.
-            The loan's leverage was your only real advantage.
-
-            **Consider selling at loan end** or refinancing to continue benefiting from leverage.
-            """)
-        else:
-            st.success(f"""
-            ✅ **Positive Real Return (+{round(effective_real_return, 1)}%/year)**
-
-            Great news! RE appreciation exceeds inflation. Your property gains real value over time.
-            The loan accelerated your gains, but holding long-term is also profitable.
-            """)
-
-        # Comparison table
-        st.subheader("📊 Value Comparison at Key Milestones")
-
-        milestones = [loan_years]
-        if projection_years > loan_years:
-            milestones.extend([min(loan_years + 5, projection_years), min(loan_years + 10, projection_years)])
-            if projection_years not in milestones:
-                milestones.append(projection_years)
-
-        milestone_data = []
-        for year in sorted(set(milestones)):
-            row = df[df["Year"] == year].iloc[0]
-            milestone_data.append({
-                "Year": year,
-                "Status": "Loan Ends" if year == loan_years else f"+{year - loan_years} years",
-                "Nominal Value": f"{fmt(row['Nominal Property Value'])} €",
-                "Actualized Value": f"{fmt(row['Actualized Property Value'])} €",
-                "Real vs Peak": f"{fmt(row['Actualized Property Value'] - exit_analysis['peak_act_value'])} €",
-                "Net Net (Act.)": f"{fmt(row['Net Net Real Estate (Act.)'])} €",
-            })
-
-        st.dataframe(pd.DataFrame(milestone_data), use_container_width=True, hide_index=True)
-
-    # NEW TAB: NOMINAL VS REAL DETAILED COMPARISON
-    with tab_nominal_vs_real:
-        st.subheader("⚖️ The Illusion of Nominal Gains")
-
-        st.markdown("""
-        <div class="insight-box">
-        <b>The Trap:</b> Looking only at nominal values makes you think you're always getting richer.
-        But <b>€100,000 in 20 years won't buy what €100,000 buys today</b>. This section reveals the gap.
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Gap analysis
-        col_gap1, col_gap2, col_gap3 = st.columns(3)
-
-        gap_at_loan_end = final_nom_at_loan - final_act_at_loan
-        gap_at_end = final_nom - final_act
-        illusion_pct = (gap_at_loan_end / final_nom_at_loan) * 100
-
-        col_gap1.metric(
-            "Nominal-Real Gap (Loan End)",
-            f"{fmt(gap_at_loan_end)} €",
-            delta=f"{round(illusion_pct, 1)}% is inflation illusion",
-            delta_color="inverse"
-        )
-        col_gap2.metric(
-            f"Nominal-Real Gap (Year {projection_years})",
-            f"{fmt(gap_at_end)} €",
-            delta=f"{round((gap_at_end / final_nom) * 100, 1)}% is inflation illusion",
-            delta_color="inverse"
-        )
-        col_gap3.metric(
-            "Discount Factor",
-            f"{round(df['Discount Factor'].iloc[-1] * 100, 1)}%",
-            help=f"€1 in Year {projection_years} = €{round(df['Discount Factor'].iloc[-1], 3)} today"
-        )
-
-        st.divider()
-
-        # Side by side gains
-        st.subheader("Net Gains: Nominal vs Actualized")
-
-        fig_gains = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=("Nominal Gains (What You See)", "Actualized Gains (What You Get)"),
-            horizontal_spacing=0.1
-        )
-
-        # Nominal
-        fig_gains.add_trace(
-            go.Scatter(x=df["Year"], y=df["Net Gain (Nominal)"], mode="lines",
-                       name="Net Gain (Nom.)", line=dict(color="#2ecc71", width=3)),
-            row=1, col=1
-        )
-        fig_gains.add_trace(
-            go.Scatter(x=df["Year"], y=df["Net Net Real Estate (Nom.)"], mode="lines",
-                       name="Net Net (Nom.)", line=dict(color="#27ae60", width=3, dash="dash")),
-            row=1, col=1
-        )
-
-        # Actualized
-        fig_gains.add_trace(
-            go.Scatter(x=df["Year"], y=df["Net Gain (Actualized)"], mode="lines",
-                       name="Net Gain (Act.)", line=dict(color="#9b59b6", width=3)),
-            row=1, col=2
-        )
-        fig_gains.add_trace(
-            go.Scatter(x=df["Year"], y=df["Net Net Real Estate (Act.)"], mode="lines",
-                       name="Net Net (Act.)", line=dict(color="#8e44ad", width=3, dash="dash")),
-            row=1, col=2
-        )
-
-        # Add loan end markers
-        fig_gains.add_vline(x=loan_years, line_dash="dash", line_color="red", opacity=0.5, row=1, col=1)
-        fig_gains.add_vline(x=loan_years, line_dash="dash", line_color="red", opacity=0.5, row=1, col=2)
-        fig_gains.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.5, row=1, col=1)
-        fig_gains.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.5, row=1, col=2)
-
-        fig_gains.update_layout(
-            height=450,
-            paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", y=-0.15),
-            hovermode="x unified"
-        )
-        fig_gains.update_yaxes(title_text="Gain (€)", row=1, col=1)
-        fig_gains.update_yaxes(title_text="Gain (€)", row=1, col=2)
-
-        st.plotly_chart(fig_gains, use_container_width=True)
-
-        st.markdown("""
-        **Left chart (Nominal):** Both lines keep rising — looks great!
-
-        **Right chart (Actualized):** The truth. Notice how gains **plateau or decline after the loan ends**.
-        This is your real wealth, adjusted for what money can actually buy.
+    if bank_real_value < loan_amount:
+        st.success(f"""
+        ### 🎉 Yes, The Bank Loses Money!
+        
+        - **Bank lent you:** €{format_currency(loan_amount)}
+        - **Bank receives (nominal):** €{format_currency(bank_nominal_receipts)}
+        - **Real value of receipts:** €{format_currency(bank_real_value)}
+        
+        The real value of what the bank gets back is **€{format_currency(loan_amount - bank_real_value)} LESS** than what they lent you.
+        
+        In real terms, the bank made a loss on this loan. **Inflation worked entirely in your favor.**
         """)
-
-        st.divider()
-
-        # Annual return comparison
-        st.subheader("Annual Return Rates: The Reality Check")
-
-        fig_returns = go.Figure()
-
-        fig_returns.add_trace(
-            go.Scatter(x=df["Year"], y=df["Nominal Annual Return (%)"], mode="lines+markers",
-                       name="Nominal Return", line=dict(color="#3498db", width=2),
-                       marker=dict(size=6))
-        )
-        fig_returns.add_trace(
-            go.Scatter(x=df["Year"], y=df["Actualized Annual Return (%)"], mode="lines+markers",
-                       name="Actualized Return", line=dict(color="#e74c3c", width=2),
-                       marker=dict(size=6))
-        )
-
-        fig_returns.add_hline(y=0, line_dash="dash", line_color="black", opacity=0.5)
-        fig_returns.add_vline(x=loan_years, line_dash="dash", line_color="red", opacity=0.7)
-        fig_returns.add_annotation(x=loan_years, y=max(df["Nominal Annual Return (%)"]),
-                                   text="Loan Ends", showarrow=False, yshift=10, font=dict(color="red"))
-
-        fig_returns.update_layout(
-            title="Year-over-Year Property Value Return",
-            xaxis_title="Year",
-            yaxis_title="Annual Return (%)",
-            height=400,
-            paper_bgcolor="rgba(0,0,0,0)",
-            hovermode="x unified"
-        )
-
-        st.plotly_chart(fig_returns, use_container_width=True)
-
-        col_ret1, col_ret2 = st.columns(2)
-        with col_ret1:
-            st.metric(
-                "Constant Nominal Return",
-                f"+{real_estate_inflation}%/year",
-                help="RE appreciation rate — always positive in our model"
-            )
-        with col_ret2:
-            st.metric(
-                "Constant Real Return",
-                f"{'+' if effective_real_return >= 0 else ''}{round(effective_real_return, 2)}%/year",
-                delta="Gain" if effective_real_return >= 0 else "Loss",
-                delta_color="normal" if effective_real_return >= 0 else "inverse",
-                help="RE appreciation minus inflation"
-            )
-
+    else:
         st.info(f"""
-        **The math is simple:**
-        - Nominal return: +{real_estate_inflation}%/year (RE appreciation)
-        - Real return: {real_estate_inflation}% - {inflation_rate}% = **{'+' if effective_real_return >= 0 else ''}{round(effective_real_return, 2)}%/year**
-
-        If this is negative, you're losing purchasing power every year you hold after the loan.
+        ### 📊 Bank Still Profits, But Less Than It Seems
+        
+        - **Bank lent you:** €{format_currency(loan_amount)}
+        - **Bank receives (nominal):** €{format_currency(bank_nominal_receipts)}
+        - **Real value of receipts:** €{format_currency(bank_real_value)}
+        
+        The bank's **real profit** is only €{format_currency(bank_real_value - loan_amount)}, not €{format_currency(metrics.total_interest_nominal)}.
+        
+        Inflation eroded **{bank_loss_pct:.1f}%** of their nominal return.
         """)
 
-    with tab_global:
-        col_pie1, col_pie2 = st.columns(2)
-        col_pie1.plotly_chart(
-            create_donut(["Principal", "Interest"], [loan_amount, result.total_int_nom], "Nominal Breakdown"),
-            use_container_width=True,
-        )
-        col_pie2.plotly_chart(
-            create_donut(["Principal (Act.)", "Interest (Act.)"], [result.total_cap_act, result.total_int_act], "Actualized Breakdown"),
-            use_container_width=True,
-        )
-
-    with tab_annual:
-        st.subheader("Property Value vs Repayments Over Time")
-        fig_immo = go.Figure()
-
-        fig_immo.add_vline(x=loan_years, line_dash="dash", line_color="red", opacity=0.7)
-        fig_immo.add_annotation(x=loan_years, y=df["Nominal Property Value"].max(), text="Loan Ends", showarrow=False, yshift=10, font=dict(color="red"))
-
-        fig_immo.add_trace(go.Scatter(x=df["Year"], y=df["Nominal Property Value"], mode="lines", name="Market Price (Nominal)", line=dict(color="#636EFA", width=3)))
-        fig_immo.add_trace(go.Scatter(x=df["Year"], y=df["Actualized Property Value"], mode="lines", name="Real Value (Actualized)", line=dict(color="#AB63FA", width=3, dash="dash")))
-        fig_immo.add_trace(go.Scatter(x=df["Year"], y=df["Cumul. Repayment (Actualized)"], mode="lines", name="Cumul. Repayment (Act.)", line=dict(color="#FFA15A", width=2)))
-        fig_immo.update_layout(xaxis_title="Year", yaxis_title="Amount (€)", height=500, hovermode="x unified", paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_immo, use_container_width=True)
-
-        st.info("""
-        **Chart Legend:**
-        - **Market Price (Blue)**: Listed price, inflated by real estate appreciation.
-        - **Real Value (Purple dashed)**: True value in today's purchasing power.
-        - **Cumul. Repayment (Orange)**: Total paid out of pocket (actualized monthly payments).
-
-        ⚠️ Notice how the purple line **peaks at loan end** then declines — this is the leverage effect disappearing!
+# TAB 2: POST-LOAN EROSION
+with tabs[1]:
+    st.subheader("📉 The Hidden Risk: What Happens After the Loan?")
+    
+    if exit_info.annual_erosion_rate > 0:
+        st.error(f"""
+        ### ⚠️ Warning: Your Real Wealth Decreases After the Loan Ends
+        
+        **During the loan:** Inflation erodes your debt = **you win**
+        
+        **After the loan:** Inflation erodes your property's real value = **you lose**
+        
+        With real estate growth ({real_estate_growth}%) < inflation ({inflation_rate}%), you lose **{exit_info.annual_erosion_rate:.1f}% of real value per year** after the loan ends.
+        """)
+    else:
+        st.success(f"""
+        ### ✅ Good News: Your Property Gains Real Value
+        
+        With real estate growth ({real_estate_growth}%) > inflation ({inflation_rate}%), your property gains **{abs(exit_info.annual_erosion_rate):.1f}% real value per year** even after the loan ends.
+        """)
+    
+    # Post-loan erosion chart
+    st.plotly_chart(
+        create_post_loan_erosion_chart(df, int(loan_years)),
+        use_container_width=True
+    )
+    
+    # Value comparison table
+    st.subheader("📊 Value at Key Milestones")
+    
+    milestones = [int(loan_years)]
+    for extra in [5, 10, 15]:
+        year = int(loan_years) + extra
+        if year <= projection_years:
+            milestones.append(year)
+    
+    milestone_data = []
+    peak_value = exit_info.peak_value_amount
+    
+    for year in milestones:
+        row = df[df["Year"] == year].iloc[0]
+        vs_peak = row["Property (Actualized)"] - peak_value
+        milestone_data.append({
+            "Year": year,
+            "Status": "🏦 Loan Ends" if year == loan_years else f"+{year - loan_years} years",
+            "Nominal Value": f"€{format_currency(row['Property (Nominal)'])}",
+            "Real Value": f"€{format_currency(row['Property (Actualized)'])}",
+            "vs Peak": f"€{format_currency(vs_peak)}" if vs_peak != 0 else "PEAK",
+            "Net Net (Real)": f"€{format_currency(row['Net Net (Actualized)'])}",
+        })
+    
+    st.dataframe(pd.DataFrame(milestone_data), use_container_width=True, hide_index=True)
+    
+    # Strategic advice
+    st.markdown("---")
+    st.subheader("🎯 Strategic Recommendations")
+    
+    if exit_info.annual_erosion_rate > 0:
+        st.markdown(f"""
+        Based on your parameters, consider these strategies:
+        
+        1. **🏷️ Sell near Year {exit_info.peak_value_year}** — This is when your property has maximum real value.
+        
+        2. **🔄 Refinance at loan end** — Taking a new loan restarts your inflation shield. You get cash out AND protection against inflation.
+        
+        3. **📈 Increase rent above inflation** — If you can raise rent by more than {inflation_rate}%/year, you can offset the value erosion.
+        
+        4. **⏰ Don't wait too long** — Every year past the loan end, you lose ~€{format_currency(exit_info.peak_value_amount * exit_info.annual_erosion_rate / 100)} in real purchasing power.
+        """)
+    else:
+        st.markdown(f"""
+        Your property is in a strong position:
+        
+        - ✅ Real estate growth exceeds inflation
+        - ✅ Property gains real value over time
+        - ✅ Holding long-term is profitable
+        
+        The loan accelerated your gains (leverage), but you can profitably hold even after it ends.
         """)
 
-    with tab_rent:
-        st.subheader("🏡 Cumulative Cash Flows (Actualized)")
-        fig_rent = go.Figure()
-        fig_rent.add_vline(x=loan_years, line_dash="dash", line_color="red", opacity=0.7)
-        fig_rent.add_trace(go.Bar(x=df["Year"], y=df["Cumul. Rent (Actualized)"], name="Cumul. Rent (Act.)", marker_color="#00CC96"))
-        fig_rent.add_trace(go.Bar(x=df["Year"], y=df["Cumul. Charges (Actualized)"], name="Cumul. Charges (Act.)", marker_color="#EF553B"))
-        fig_rent.update_layout(barmode="group", xaxis_title="Year", yaxis_title="Actualized Amount (€)", height=450, paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_rent, use_container_width=True)
+# TAB 3: BANK'S PERSPECTIVE
+with tabs[2]:
+    st.subheader("🏦 From the Bank's Point of View")
+    
+    st.markdown("""
+    Banks lend at nominal rates, but inflation erodes the real value of what they receive back.
+    The green area shows how much purchasing power the bank loses.
+    """)
+    
+    st.plotly_chart(
+        create_bank_perspective_chart(df, loan_amount, int(loan_years)),
+        use_container_width=True
+    )
+    
+    col1, col2, col3 = st.columns(3)
+    
+    col1.metric(
+        "Bank Lent",
+        f"€{format_currency(loan_amount)}"
+    )
+    col2.metric(
+        "Bank Receives (Nominal)",
+        f"€{format_currency(bank_nominal_receipts)}",
+        delta=f"+€{format_currency(metrics.total_interest_nominal)} interest"
+    )
+    col3.metric(
+        "Real Value of Receipts",
+        f"€{format_currency(bank_real_value)}",
+        delta=f"-€{format_currency(bank_loss)} vs nominal",
+        delta_color="inverse"
+    )
+    
+    st.markdown("---")
+    
+    # Real interest rate calculation
+    nominal_rate = annual_rate
+    real_rate = ((1 + nominal_rate/100) / (1 + inflation_rate/100) - 1) * 100
+    
+    st.subheader("📊 Interest Rate Reality Check")
+    
+    col_r1, col_r2, col_r3 = st.columns(3)
+    col_r1.metric("Nominal Interest Rate", f"{nominal_rate:.1f}%")
+    col_r2.metric("Inflation Rate", f"{inflation_rate:.1f}%")
+    col_r3.metric(
+        "Real Interest Rate",
+        f"{real_rate:.2f}%",
+        help="What the bank actually earns after inflation"
+    )
+    
+    if real_rate < 0:
+        st.error(f"""
+        **The real interest rate is NEGATIVE!**
+        
+        The bank charges {nominal_rate:.1f}% but inflation is {inflation_rate:.1f}%. 
+        In real terms, the bank is paying YOU {abs(real_rate):.2f}%/year to borrow their money!
+        """)
+    elif real_rate < 1:
+        st.warning(f"""
+        **The bank barely makes money in real terms.**
+        
+        Their real return is only {real_rate:.2f}%/year — barely keeping up with inflation.
+        """)
 
-    with tab_waterfall:
-        st.subheader("🏆 Net Net Breakdown (Actualized vs Nominal) at Loan End")
-        col_w1, col_w2 = st.columns(2)
-        labels = ["Property Value", "Rental Income", "Credit Cost", "Taxes/Charges", "Net Net Balance"]
-
-        values_act = [final_act_at_loan, result.total_rent_act, -total_cost_act, -result.total_charges_act, 0]
-        fig_w_act = go.Figure(go.Waterfall(
-            orientation="v",
-            measure=["relative", "relative", "relative", "relative", "total"],
-            x=labels,
-            y=values_act,
-            connector={"line": {"color": "gray"}},
-            increasing={"marker": {"color": "#00CC96"}},
-            decreasing={"marker": {"color": "#EF553B"}},
-            totals={"marker": {"color": "#636EFA"}},
+# TAB 4: NOMINAL VS REAL
+with tabs[3]:
+    st.subheader("⚖️ The Illusion of Nominal Values")
+    
+    st.markdown("""
+    **Nominal values** (what you see on paper) always look better than **real values** (actual purchasing power).
+    This gap is the "inflation illusion" — don't let it fool you!
+    """)
+    
+    # Gap metrics
+    gap_at_end = final_row["Property (Nominal)"] - final_row["Property (Actualized)"]
+    illusion_pct = (gap_at_end / final_row["Property (Nominal)"]) * 100
+    
+    col1, col2, col3 = st.columns(3)
+    
+    col1.metric(
+        f"Nominal Value (Year {projection_years})",
+        f"€{format_currency(final_row['Property (Nominal)'])}"
+    )
+    col2.metric(
+        f"Real Value (Year {projection_years})",
+        f"€{format_currency(final_row['Property (Actualized)'])}"
+    )
+    col3.metric(
+        "Inflation Illusion",
+        f"€{format_currency(gap_at_end)}",
+        delta=f"{illusion_pct:.0f}% of nominal is illusion",
+        delta_color="inverse"
+    )
+    
+    # Side by side comparison
+    st.markdown("---")
+    st.subheader("Net Gains: Paper vs Reality")
+    
+    col_chart1, col_chart2 = st.columns(2)
+    
+    with col_chart1:
+        fig_nom = go.Figure()
+        fig_nom.add_trace(go.Scatter(
+            x=df["Year"], y=df["Net Gain (Nominal)"],
+            name="Net Gain", line=dict(color="#27ae60", width=2)
         ))
-        fig_w_act.update_layout(title="Real Gain (Actualized)", height=450, paper_bgcolor="rgba(0,0,0,0)")
-        col_w1.plotly_chart(fig_w_act, use_container_width=True)
-
-        values_nom = [final_nom_at_loan, result.total_rent_nom, -(loan_amount + result.total_int_nom), -result.total_charges_nom, 0]
-        fig_w_nom = go.Figure(go.Waterfall(
-            orientation="v",
-            measure=["relative", "relative", "relative", "relative", "total"],
-            x=labels,
-            y=values_nom,
-            connector={"line": {"color": "gray"}},
-            increasing={"marker": {"color": "#2ecc71"}},
-            decreasing={"marker": {"color": "#e74c3c"}},
-            totals={"marker": {"color": "#34495e"}},
+        fig_nom.add_trace(go.Scatter(
+            x=df["Year"], y=df["Net Net (Nominal)"],
+            name="Net Net", line=dict(color="#2ecc71", width=3)
         ))
-        fig_w_nom.update_layout(title="Gross Gain (Nominal)", height=450, paper_bgcolor="rgba(0,0,0,0)")
-        col_w2.plotly_chart(fig_w_nom, use_container_width=True)
-
-    with tab_stock:
-        st.subheader("💰 Real Estate vs Stock Market")
-        st.write(f"Alternative scenario: You invest the down payment (**{fmt(down_payment)} €**) and invest the monthly payment (**{fmt(result.monthly_payment)} €**) in stocks at **{stock_return}%/year**.")
-
-        col_comp1, col_comp2 = st.columns(2)
-
-        fig_c_act = go.Figure()
-        fig_c_act.add_vline(x=loan_years, line_dash="dash", line_color="red", opacity=0.7)
-        fig_c_act.add_trace(go.Scatter(x=df["Year"], y=df["Net Net Real Estate (Act.)"], mode="lines", name="Real Estate Gain (Act.)", line=dict(color="#00CC96", width=4)))
-        fig_c_act.add_trace(go.Scatter(x=df["Year"], y=df["Stock Gain (Act.)"], mode="lines", name="Stock Gain (Act.)", line=dict(color="#17becf", width=4)))
-        fig_c_act.update_layout(title="Real Gain Comparison (Actualized)", xaxis_title="Year", height=450, hovermode="x unified", paper_bgcolor="rgba(0,0,0,0)")
-        col_comp1.plotly_chart(fig_c_act, use_container_width=True)
-
-        fig_c_nom = go.Figure()
-        fig_c_nom.add_vline(x=loan_years, line_dash="dash", line_color="red", opacity=0.7)
-        fig_c_nom.add_trace(go.Scatter(x=df["Year"], y=df["Net Net Real Estate (Nom.)"], mode="lines", name="Real Estate Gain (Nom.)", line=dict(color="#00CC96", width=4)))
-        fig_c_nom.add_trace(go.Scatter(x=df["Year"], y=df["Stock Gain (Nom.)"], mode="lines", name="Stock Gain (Nom.)", line=dict(color="#17becf", width=4)))
-        fig_c_nom.update_layout(title="Gross Gain Comparison (Nominal)", xaxis_title="Year", height=450, hovermode="x unified", paper_bgcolor="rgba(0,0,0,0)")
-        col_comp2.plotly_chart(fig_c_nom, use_container_width=True)
-
-        st.info("Stock gain = final portfolio value minus total invested (down payment + monthly payments). After loan ends, no new stock investments are made.")
-
-    with tab_sensitivity:
-        st.subheader("Inflection & Profitability Analysis")
-        st.info("""
-        **Understanding thresholds:**
-        - **Net Inflection (dotted)**: Equity focus (Property Value - Debt).
-        - **Net Net Inflection (solid)**: Total view (Equity + Cash Flows).
-        """)
-        col_s1, col_s2, col_s3 = st.columns(3)
-
-        rate_range, net_rate, net_net_rate = compute_sensitivity_rate(
-            property_value, loan_amount, int(loan_years), inflation_rate,
-            real_estate_inflation, initial_rent, property_tax,
-            occupancy_rate, stock_return, down_payment
+        fig_nom.add_hline(y=0, line_dash="dash")
+        fig_nom.add_vline(x=loan_years, line_dash="dash", line_color="red")
+        fig_nom.update_layout(
+            title="Nominal (Paper) Gains",
+            xaxis_title="Year", yaxis_title="Gain (€)",
+            height=400, paper_bgcolor="rgba(0,0,0,0)",
+            legend=dict(orientation="h", y=-0.15)
         )
-        col_s1.plotly_chart(create_sensitivity_chart(rate_range, net_rate, net_net_rate, "Sensitivity: Interest Rate", "#17becf"), use_container_width=True)
-        col_s1.metric("Net Inflection", f"{round(rate_range[np.argmin(np.abs(net_rate))], 2)}%")
-        col_s1.metric("Net Net Inflection", f"{round(rate_range[np.argmin(np.abs(net_net_rate))], 2)}%")
-        col_s1.write("**Insight:** The lower your rate compared to Net Net inflection, the stronger your leverage effect.")
-
-        market_range, net_market, net_net_market = compute_sensitivity_market(
-            property_value, int(loan_years), inflation_rate,
-            total_cost_act, result.total_rent_act, result.total_charges_act
+        st.plotly_chart(fig_nom, use_container_width=True)
+        st.caption("📈 Looks great! Always going up...")
+    
+    with col_chart2:
+        fig_act = go.Figure()
+        fig_act.add_trace(go.Scatter(
+            x=df["Year"], y=df["Net Gain (Actualized)"],
+            name="Net Gain", line=dict(color="#8e44ad", width=2)
+        ))
+        fig_act.add_trace(go.Scatter(
+            x=df["Year"], y=df["Net Net (Actualized)"],
+            name="Net Net", line=dict(color="#9b59b6", width=3)
+        ))
+        fig_act.add_hline(y=0, line_dash="dash")
+        fig_act.add_vline(x=loan_years, line_dash="dash", line_color="red")
+        fig_act.update_layout(
+            title="Actualized (Real) Gains",
+            xaxis_title="Year", yaxis_title="Gain (€)",
+            height=400, paper_bgcolor="rgba(0,0,0,0)",
+            legend=dict(orientation="h", y=-0.15)
         )
-        col_s2.plotly_chart(create_sensitivity_chart(market_range, net_market, net_net_market, "Sensitivity: RE Market", "#ff7f0e"), use_container_width=True)
-        col_s2.metric("Net Inflection", f"{round(market_range[np.argmin(np.abs(net_market))], 2)}%")
-        col_s2.metric("Net Net Inflection", f"{round(market_range[np.argmin(np.abs(net_net_market))], 2)}%")
-        col_s2.write("**Insight:** If Net Net inflection is negative, the property makes you richer even if the market drops slightly.")
+        st.plotly_chart(fig_act, use_container_width=True)
+        st.caption("📉 Reality: peaks then declines after loan ends")
 
-        inf_range, net_inf, net_net_inf = compute_sensitivity_inflation(
-            property_value, loan_amount, annual_rate, int(loan_years),
-            real_estate_inflation, initial_rent, property_tax,
-            occupancy_rate, stock_return, down_payment
+# TAB 5: FULL EVOLUTION
+with tabs[4]:
+    st.subheader("📈 Complete Property Value Evolution")
+    
+    st.plotly_chart(
+        create_main_evolution_chart(df, int(loan_years)),
+        use_container_width=True
+    )
+    
+    st.info("""
+    **How to read this chart:**
+    - **Blue line (Nominal):** The "sticker price" — what you'd see in real estate listings. Always rising.
+    - **Purple line (Actualized):** Real purchasing power. Notice how it peaks around when the loan ends!
+    - **Red star:** The optimal moment to capture maximum real value.
+    - **Bottom bars:** Green = real value increased that year. Red = real value decreased.
+    """)
+
+# TAB 6: RENT & CHARGES
+with tabs[5]:
+    st.subheader("💰 Rental Income & Charges")
+    
+    fig_rent = go.Figure()
+    fig_rent.add_trace(go.Bar(
+        x=df["Year"], y=df["Cumul. Rent (Actualized)"],
+        name="Cumulative Rent (Real)", marker_color="#27ae60"
+    ))
+    fig_rent.add_trace(go.Bar(
+        x=df["Year"], y=df["Cumul. Charges (Actualized)"],
+        name="Cumulative Charges (Real)", marker_color="#e74c3c"
+    ))
+    fig_rent.add_vline(x=loan_years, line_dash="dash", line_color="gray")
+    fig_rent.update_layout(
+        title="Cumulative Cash Flows (Actualized)",
+        barmode="group",
+        xaxis_title="Year", yaxis_title="Amount (€)",
+        height=450, paper_bgcolor="rgba(0,0,0,0)"
+    )
+    st.plotly_chart(fig_rent, use_container_width=True)
+    
+    # Net rental income
+    net_rent = metrics.total_rent_actualized - metrics.total_charges_actualized
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Rent (Real)", f"€{format_currency(metrics.total_rent_actualized)}")
+    col2.metric("Total Charges (Real)", f"€{format_currency(metrics.total_charges_actualized)}")
+    col3.metric("Net Rental Income", f"€{format_currency(net_rent)}")
+
+# TAB 7: STOCK COMPARISON
+with tabs[6]:
+    st.subheader("📊 Real Estate vs Stock Market")
+    
+    st.markdown(f"""
+    **Alternative scenario:** Instead of buying property, you invest:
+    - Down payment (€{format_currency(down_payment)}) immediately
+    - Monthly payment (€{format_currency(metrics.monthly_payment)}) each month during the loan
+    - At {stock_return}%/year return
+    """)
+    
+    # Comparison chart
+    fig_stock = go.Figure()
+    fig_stock.add_trace(go.Scatter(
+        x=df["Year"], y=df["Net Net (Actualized)"],
+        name="Real Estate (Net Net)", line=dict(color="#27ae60", width=3)
+    ))
+    fig_stock.add_trace(go.Scatter(
+        x=df["Year"], y=df["Stock Gain (Actualized)"],
+        name="Stock Portfolio", line=dict(color="#3498db", width=3)
+    ))
+    fig_stock.add_vline(x=loan_years, line_dash="dash", line_color="red")
+    fig_stock.add_hline(y=0, line_dash="dash", line_color="gray")
+    fig_stock.update_layout(
+        title="Actualized Gains: Real Estate vs Stocks",
+        xaxis_title="Year", yaxis_title="Gain (€)",
+        height=450, paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=-0.1)
+    )
+    st.plotly_chart(fig_stock, use_container_width=True)
+    
+    # Final comparison
+    final_re = final_row["Net Net (Actualized)"]
+    final_stock = final_row["Stock Gain (Actualized)"]
+    winner = "Real Estate" if final_re > final_stock else "Stocks"
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric(f"Real Estate (Year {projection_years})", f"€{format_currency(final_re)}")
+    col2.metric(f"Stocks (Year {projection_years})", f"€{format_currency(final_stock)}")
+    col3.metric("Winner", winner, delta=f"€{format_currency(abs(final_re - final_stock))} ahead")
+
+# TAB 8: SENSITIVITY
+with tabs[7]:
+    st.subheader("🔍 Sensitivity Analysis")
+    
+    st.markdown("""
+    These charts show how your results change with different assumptions.
+    The **inflection point** is where gains turn to losses (or vice versa).
+    """)
+    
+    col_s1, col_s2, col_s3 = st.columns(3)
+    
+    # Interest rate sensitivity
+    rate_range, net_rate, net_net_rate = compute_rate_sensitivity(
+        property_value, loan_amount, int(loan_years), inflation_rate,
+        real_estate_growth, monthly_rent, property_tax,
+        occupancy_rate, stock_return, down_payment
+    )
+    
+    with col_s1:
+        st.plotly_chart(
+            create_sensitivity_chart(rate_range, net_rate, net_net_rate, 
+                                     "Interest Rate Impact", "Rate (%)", "#17becf"),
+            use_container_width=True
         )
-        col_s3.plotly_chart(create_sensitivity_chart(inf_range, net_inf, net_net_inf, "Sensitivity: Inflation", "#e377c2"), use_container_width=True)
-        col_s3.metric("Net Inflection", f"{round(inf_range[np.argmin(np.abs(net_inf))], 2)}%")
-        col_s3.metric("Net Net Inflection", f"{round(inf_range[np.argmin(np.abs(net_net_inf))], 2)}%")
-        col_s3.write("**Insight:** Inflation is the borrower's ally — it erodes the real value of debt over time.")
+        inflection_net = rate_range[np.argmin(np.abs(net_rate))]
+        inflection_net_net = rate_range[np.argmin(np.abs(net_net_rate))]
+        st.metric("Break-even Rate (Net)", f"{inflection_net:.1f}%")
+        st.metric("Break-even Rate (Net Net)", f"{inflection_net_net:.1f}%")
+    
+    # Market sensitivity
+    market_range, net_market, net_net_market = compute_market_sensitivity(
+        property_value, int(loan_years), inflation_rate,
+        metrics.total_cost_actualized, metrics.total_rent_actualized, metrics.total_charges_actualized
+    )
+    
+    with col_s2:
+        st.plotly_chart(
+            create_sensitivity_chart(market_range, net_market, net_net_market,
+                                     "RE Market Impact", "Growth (%)", "#ff7f0e"),
+            use_container_width=True
+        )
+        inflection_net = market_range[np.argmin(np.abs(net_market))]
+        inflection_net_net = market_range[np.argmin(np.abs(net_net_market))]
+        st.metric("Break-even Growth (Net)", f"{inflection_net:.1f}%")
+        st.metric("Break-even Growth (Net Net)", f"{inflection_net_net:.1f}%")
+    
+    # Inflation sensitivity
+    inf_range, net_inf, net_net_inf = compute_inflation_sensitivity(
+        property_value, loan_amount, annual_rate, int(loan_years),
+        real_estate_growth, monthly_rent, property_tax,
+        occupancy_rate, stock_return, down_payment
+    )
+    
+    with col_s3:
+        st.plotly_chart(
+            create_sensitivity_chart(inf_range, net_inf, net_net_inf,
+                                     "Inflation Impact", "Inflation (%)", "#e377c2"),
+            use_container_width=True
+        )
+        inflection_net = inf_range[np.argmin(np.abs(net_inf))]
+        inflection_net_net = inf_range[np.argmin(np.abs(net_net_inf))]
+        st.metric("Break-even Inflation (Net)", f"{inflection_net:.1f}%")
+        st.metric("Break-even Inflation (Net Net)", f"{inflection_net_net:.1f}%")
 
-    with tab_data:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+# TAB 9: DATA
+with tabs[8]:
+    st.subheader("📑 Complete Data Table")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    
+    # Download button
+    csv = df.to_csv(index=False)
+    st.download_button(
+        label="📥 Download as CSV",
+        data=csv,
+        file_name="leverage_vs_erosion_analysis.csv",
+        mime="text/csv"
+    )
 
-else:
-    st.warning("⚠️ Your down payment covers the entire property. No financing needed.")
-
-st.caption("Note: Actualization converts all future amounts to today's purchasing power (constant euros).")
+# =============================================================================
+# FOOTER
+# =============================================================================
+st.markdown("---")
+st.caption("""
+**Glossary:**
+- **Nominal:** Face value in euros (what you see on paper)
+- **Actualized:** Real purchasing power (adjusted for inflation)
+- **Net:** Property value minus loan cost
+- **Net Net:** Net plus rental income minus charges
+- **Discount Factor:** How much €1 future is worth today
+""")
